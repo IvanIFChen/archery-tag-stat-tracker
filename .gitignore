@@ -1,0 +1,7 @@
+videos/
+.DS_Store
+.venv/
+__pycache__/
+out/
+models/
+*.pt
