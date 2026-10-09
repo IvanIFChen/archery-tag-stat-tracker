@@ -14,8 +14,8 @@ _Last updated: 2026-10-08_
 | Tracking | ⚠️ Works, but IDs fragment (one player becomes many track IDs) |
 | Shot detection (pose) | ⚠️ 63% of real shots found, 44% of counted shots real (v3) |
 | Shot detection (arrows) | ⚠️ 49% found, **68%** of counted shots real; 34% found / 86% real in a stricter setting (A4, see [Arrow detection](#arrow-detection-long-exposure)) |
-| Shooter attribution from arrows | ⚠️ First try: even for real arrows, only about 55% get the right player at the right time. Straight-line tracing is bent by the fisheye |
-| Lens correction | 🚧 Seam found (x = 1822, two GoPros). Calibrating from the scene alone isn't enough; blocked on camera info (see [Lens correction](#lens-fisheye-correction-in-progress-blocked-on-camera-info)) |
+| Shooter attribution from arrows | ⚠️ With lens correction: 64% of credited shots right (at 26% of all shots found, strict arrow setting); was 55% / 17% without |
+| Lens correction + re-stitch | ✅ Two GoPro halves corrected and re-joined: far baseline straight, center pillar aligned. GoPro lens values fixed; each video gets its own stitch profile (see [Lens correction](#lens-correction-and-re-stitching-lenspy-)) |
 | Who's who (player identity) | ⏳ Not started |
 | Hits / catches | ⏳ Not started |
 
@@ -148,53 +148,74 @@ Runs at about 3× real time on an M1 Pro (18 s for 60 s of video).
 
 **Crediting a shooter** ([`attribute.py`](src/archery_tag_stat_tracker/attribute.py)): fit a line through the flight and extend it back into the shooter's half. Then pick the tracked player whose shoulders are closest to that line, within 0.8 player-heights, in the 0.6 s before the arrow first appears. Scored strictly (right time **and** the label click inside that player's box):
 
-| Arrow setting | Arrows found | Credited to the right player at the right time: recall / precision |
-|---|---|---|
-| ≥ 4 points | 63% / 27% | 29% / 16% |
-| ≥ 5 points | 49% / 68% | 20% / 35% |
-| ≥ 6 points | 34% / 86% | 17% / 55% |
+| Arrow setting | Arrows found | Right player at the right time (raw frame), recall / precision | Same, **lens-corrected** |
+|---|---|---|---|
+| ≥ 4 points | 63% / 27% | 29% / 16% | 37% / 19% |
+| ≥ 5 points | 49% / 68% | 20% / 35% | 29% / 42% |
+| ≥ 6 points | 34% / 86% | 17% / 55% | **26% / 64%** |
 
-Even when the arrow is real, it's credited to the wrong player about 45% of the time. A straight line extended over hundreds of fisheye-bent pixels drifts off the shooter. That's the motivation for [lens correction](#lens-fisheye-correction-in-progress-blocked-on-camera-info).
+In the raw frame, even real arrows were credited to the wrong player about 45% of the time: a straight line extended over hundreds of fisheye-bent pixels drifts off the shooter. Doing the geometry in [lens-corrected](#lens-correction-and-re-stitching-lenspy-) coordinates raised both numbers by about 9 points. The remaining misses are mostly shooters who aren't tracked at the release moment, or several players close to the line.
 
 ## Experiments
 
-### Lens (fisheye) correction: in progress, blocked on camera info
+### Lens correction and re-stitching: [`lens.py`](src/archery_tag_stat_tracker/lens.py) ✅
 
-**Why it matters:** crediting an arrow to its shooter means extending the flight's line back into the shooter's half. The fisheye bends straight flights into curves, so a long extension drifts off the true shooter. With each lens corrected, a straight 3D flight looks straight on screen (apart from the arrow's small drop), and tracing it back becomes reliable. Correction also enables a top-down court map.
+**Why:** crediting an arrow to its shooter means extending the flight's line back into the shooter's half. The fisheye bends straight flights, so long extensions drift off the shooter. Corrected coordinates fixed a good part of that (see [Crediting a shooter](#6-arrow-detection-long-exposure-arrowspy)).
 
-**The setup:** the footage is **two GoPros** (one per half), stitched side by side. I first tried a single fisheye model for the whole frame. That can't work: no single setting straightens the field lines, because the frame contains two different lenses.
+![before / after](docs/img/lens_before_after.jpg)
 
-![single-model undistortion test](docs/img/undistort_test.jpg)
-
-**Seam:** a hard cut at **x = 1822**, with no blending. It's the same at every height, which I found from a step in brightness and texture down that column across 30 frames. The far pillar visibly jumps at the seam because each camera sees it from a slightly different position. The left camera covers x 0–1822 and the right camera x 1822–3490.
+**The setup:** two GoPros, one per half, stitched side by side with a **hard cut** (the seam) through the neutral zone. In this video the seam is at x = 1822. The far pillar visibly jumps there because each camera sees it from a slightly different position.
 
 ![seam zoom](docs/img/seam_zoom.jpg)
 
-**Calibrating without a checkerboard** ([`calib.py`](src/archery_tag_stat_tracker/calib.py)):
-- Take the median of 60 frames to get an empty court.
-- Mark rough seed points on features that are straight in reality: neutral-zone lines, far baselines, side-wall bases, and post edges.
-- Snap each seed to the exact paint line or edge along its normal, to sub-pixel accuracy.
-- Fit an OpenCV fisheye model so those features come out straight.
+**The final model** (variant "T4", chosen by eye), applied to each half:
+1. **Radial lens correction**, k1 = **+0.2**, with each lens center placed **on the seam**, at the height of the far baseline (y = 190). Radial correction keeps lines through the lens center straight, so the seam column stays a straight vertical line in both halves. With the same settings on both sides, the halves still meet with **no black gap in the middle**.
+2. **Zoom**, so the seam column fills the full height.
+3. **Far-baseline alignment.** In the source, the far baseline is two straight segments forming a "^" with a ~12px step at the seam: slopes −0.14 on the left and +0.14 on the right. Steps:
+   - Shear each half by 0.60 of its slope.
+   - Stretch each half vertically about the seam's bottom so the segments meet.
+   - Shear again so both segments lie on one line.
 
-![snapped line points](docs/img/calib_seeds.jpg)
+   Result: one level line, slope −0.001, with points 2.4px RMS off it.
+4. **Pillar seam warp.** The two cameras see the far center pillar with parallax: the pad top and base were 7px apart across the seam, the right edge leaned, and the logo showed twice. A local warp of the right half near the seam fixes this:
+   - a vertical stretch that matches the pad top and base;
+   - a sideways shift of −23px at the top to −9px at the base, which removes the duplicated strip and makes the edges vertical.
 
-| Attempt | Model | Result |
+   It fades out over 400px into the right half and below y≈300–600, so the rest of the frame is untouched.
+
+![pillar: original / lens+baseline / final](docs/img/lens_pillar.jpg)
+
+The outer corners stay black. That's expected with radial correction, and nothing is lost there. `Lens.points()` corrects coordinates (arrow blobs, keypoints, boxes) without warping pixels. `Lens.frame()` warps whole frames.
+
+**How we got there.** Automatic fitting failed, so I rendered candidates and you picked between them:
+
+| Round | Candidates | Outcome |
 |---|---|---|
-| C1 | per half: f, cx, cy, k1, k2; residual = distance off the fitted line in undistorted coordinates ÷ line length | Fake success (right-half error went to 0). Stretching points toward the edge of the lens makes the lines "long", which shrinks the error |
-| C2 | Same, but the residual is each viewing ray's angle off a great circle (a straight 3D line seen from the camera lies in a plane through the camera) | Fake success again: a huge f squeezes all rays together |
-| C3 | C2 ÷ the line's angular span; bounds for a GoPro-like 100–130° field of view | The lens centers drift far off-center and the corrected halves are clearly warped (below) |
-| C4 | Shared f, k1, k2 for both cameras; lens centers fixed at the middle of each half; curved padding edges removed | The fit runs into its bounds and barely helps (error 0.026 → 0.024). The halves don't behave like centered GoPro frames, probably because the stitcher cropped each camera off-center |
+| Auto-fit | Fisheye model fitted to snapped "straight" lines (4 variants) | ❌ Degenerate fits: they made lines look straight by distorting the image wrongly. Partly because the stitcher had already over-dewarped each half, so the needed correction is the *opposite* sign from a raw GoPro fisheye |
+| 1 | Radial k1 −0.45 … +0.2; fisheye f 700–1400 | k1 = **+0.2** "very close" |
+| 2–3 | Rulers on the lines; lens centers on the seam to close the middle gap | Middle gap closed, but the far baseline was still kinked |
+| 4–6 | Shear vs rotate each half to level the baseline | Rotation opens a wedge. Full shear looked wrong, because the automatic baseline points had snapped to bunker edges and turf texture |
+| 7 | Partial shears | 0.60 shear (N1) best |
+| 8–9 | **Hand-picked** baseline points from zoomed full-res crops; align plus make collinear | Q3/Q4 "perfect" |
+| 10–11 | Local pillar warp strengths | T4 "perfect" |
 
-![C3 free fit: wrong](docs/img/calib_free_fit.jpg)
+![baseline variants (zoomed far end)](docs/img/lens_baseline_options.jpg)
 
-**Where this stands:** a handful of floor lines and posts aren't enough to pin down an off-center, cropped fisheye. One of these would unblock it:
-1. The GoPro model and lens mode (Wide, SuperView or Linear). Known lens profiles would fix the distortion terms, and only the crop offset would need fitting.
-2. The raw per-camera files. No crop, a known lens center, and better quality than the YouTube upload.
-3. A 20-second clip of a checkerboard (printed or on a tablet) waved in front of each mounted camera. Only worth it if the cameras are mounted in the same place each week.
+Lessons:
+- The stitched halves aren't raw GoPro frames.
+- Automatic line snapping is unreliable on this footage; hand-pick reference points from zoomed crops.
+- Leveling a line isn't the same as straightening it. Each camera is turned away from the center, so some slope is real perspective.
 
-**Plan once calibrated:** undistort only the points we need (arrow blobs, keypoints, boxes) for geometry, which is instant and doesn't touch detection. Then build a re-stitched corrected view, cylindrical rather than flat, since together the two cameras cover nearly 180°. Then a top-down court map.
+**Equipment vs per-video settings.** `EQUIPMENT` in `lens.py` holds the GoPro lens values (k1 and focal lengths), which stay fixed while the cameras are the same. Everything tied to how a particular video was stitched lives in a **per-video profile**, [`data/stitch/<video>.json`](data/stitch/va-S1pJyK5U.json): the seam, baseline points, shear and pillar warp.
+- `lens seam <video>` detects the seam automatically (it found 1823 here, against 1822 by hand).
+- `lens build <profile> --video <video>` refuses to build if the seam doesn't match the profile.
 
-**Earlier finding that still holds:** warping whole frames for *detection* probably won't help. It shrinks the far end, which is exactly where the detector struggles.
+**Redoing this for a new video:** camera angles and the cut can change between nights, so expect to redo the alignment. The lens values should carry over.
+1. Detect the seam with `lens seam`.
+2. Make a people-free background frame (the median of about 60 frames).
+3. Hand-pick far-baseline points on both sides from zoomed crops.
+4. Render shear and pillar variants, and pick by eye.
+5. Save a new profile, then run `lens build`.
 
 ## Usage
 

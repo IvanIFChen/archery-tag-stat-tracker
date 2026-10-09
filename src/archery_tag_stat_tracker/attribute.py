@@ -38,22 +38,28 @@ def fit_line(pts):
     return p[0], d
 
 
-def attribute(d: dict, flights: list, **shot_kw) -> list:
+def attribute(d: dict, flights: list, lens=None, **shot_kw) -> list:
+    """With `lens` (lens.Lens), geometry is done in lens-corrected coordinates,
+    where a straight flight stays straight when extended back to the shooter."""
     fps = float(d["fps"])
     frames = d["frame"]
+    fix = (lambda p: lens.points(np.asarray(p, float).reshape(-1, 2))) if lens else (lambda p: np.asarray(p, float).reshape(-1, 2))
     out = []
     for s in dedupe([s for s in flights if is_shot(s, **shot_kw)]):
-        p0, u = fit_line(s["pts"])
+        pts = fix([q[1:3] for q in s["pts"]])
+        p0, u = fit_line([(q[0], *xy) for q, xy in zip(s["pts"], pts)])
         f0 = s["pts"][0][0]
         shooter_left = s["vx"] > 0
         cand = np.flatnonzero((frames >= f0 - LOOKBACK_S * fps) & (frames <= f0 + 2))
         best = None
         for i in cand:
             box = d["box"][i]
-            h = box[3] - box[1]
-            q = upper_body(d["kp"][i], box)
-            if (q[0] < zone_mid(q[1])) != shooter_left:
+            q0 = upper_body(d["kp"][i], box)
+            if (q0[0] < zone_mid(q0[1])) != shooter_left:  # side test in source coords
                 continue
+            cx = (box[0] + box[2]) / 2
+            top, bot, q = fix([(cx, box[1]), (cx, box[3]), q0])
+            h = float(np.hypot(*(bot - top)))
             v = q - p0
             along = float(np.dot(v, u))  # negative = behind the flight start
             perp = abs(float(v[0] * u[1] - v[1] * u[0]))
@@ -76,10 +82,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("tracks", type=Path)
     p.add_argument("arrows", type=Path)
+    p.add_argument("--lens", action="store_true", help="use data/lens.json correction")
     p.add_argument("--out", type=Path, default=Path("out/attributed.json"))
     a = p.parse_args()
     d = dict(np.load(a.tracks))
-    shots = attribute(d, json.loads(a.arrows.read_text())["flights"])
+    lens = None
+    if a.lens:
+        from .lens import Lens
+        lens = Lens.load()
+    shots = attribute(d, json.loads(a.arrows.read_text())["flights"], lens)
     a.out.write_text(json.dumps(shots, indent=1))
     print(f"{len(shots)} attributed shots -> {a.out}")
 
