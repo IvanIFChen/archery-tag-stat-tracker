@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lens Tuner</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg: #0f1012; --panel: #17191c; --fg: #e8e8e8; --muted: #8a8f98; --line: #2a2d32; --accent: #4da3ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+  #panel { width: 330px; min-width: 330px; background: var(--panel); border-right: 1px solid var(--line); overflow-y: auto; padding: 10px 12px 40px; }
+  #stage { flex: 1; position: relative; overflow: hidden; }
+  canvas { position: absolute; left: 0; top: 0; }
+  #gl { background: #141414; }
+  #ov { cursor: crosshair; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+  h2:first-of-type { border-top: 0; margin-top: 4px; }
+  .row { display: grid; grid-template-columns: 92px 1fr 64px; gap: 6px; align-items: center; margin: 3px 0; }
+  .row label { color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row input[type=range] { width: 100%; }
+  .row input[type=number] { width: 64px; background: #0c0d0f; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; font: 12px ui-monospace, monospace; }
+  .chk { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  .hint { color: var(--muted); font-size: 11px; margin: 2px 0 6px; line-height: 1.35; }
+  button, select { background: #23262b; color: var(--fg); border: 1px solid #3a3e45; border-radius: 5px; padding: 5px 10px; cursor: pointer; font: inherit; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04111f; font-weight: 600; }
+  .btns { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  #stats { font: 11.5px ui-monospace, monospace; line-height: 1.5; white-space: pre; color: #cfd3da; }
+  #status { color: #6fdc8c; font-size: 12px; min-height: 16px; }
+  #help { position: absolute; right: 10px; bottom: 8px; color: #aaa; font-size: 11px; background: #000a; padding: 4px 8px; border-radius: 4px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <div class="btns">
+    <button class="primary" id="save">Save</button>
+    <button id="revert" title="Reload the last saved values">Revert</button>
+    <select id="image"></select>
+  </div>
+  <div id="status"></div>
+  <div id="controls"></div>
+  <h2>Overlays</h2>
+  <div id="overlays"></div>
+  <h2>Measurements</h2>
+  <div class="hint">Angle = degrees from horizontal. Bend = RMS px off the best straight line.</div>
+  <div id="stats"></div>
+</div>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <canvas id="ov"></canvas>
+  <div id="help">drag a numbered corner: stretch that half · drag elsewhere: draw ruler · shift/right-drag: pan · wheel: zoom · dbl-click: fit · ⌫ undo ruler · C clear</div>
+</div>
+<script>
+"use strict";
+// ---------- model (keep in sync with lens.py build()) ----------
+const SPEC = [
+  ["Lens (equipment)", null],
+  ["k1", "equipment.k1", -0.6, 0.6, 0.005],
+  ["k2", "equipment.k2", -0.5, 0.5, 0.005],
+  ["k3", "equipment.k3", -0.5, 0.5, 0.005],
+  ["center y", "equipment.cy", -600, 1400, 1],
+  ["focal L", "equipment.f.left", 300, 5000, 1],
+  ["focal R", "equipment.f.right", 300, 5000, 1],
+  ["zoom", "equipment.zoom", 0.2, 2.5, 0.01],
+  ["Camera turn (mirrored L/R)", null],
+  ["yaw", "camera.yaw", -60, 60, 0.1],
+  ["pitch", "camera.pitch", -60, 60, 0.1],
+  ["roll", "camera.roll", -30, 30, 0.1],
+  ["Stitch", null],
+  ["seam x", "seam", 1500, 2100, 1],
+  ["shear", "shear", -1, 2, 0.01],
+  ["!align", "align", "baselines meet at the seam"],
+  ["!collinear", "collinear", "baselines on one straight line"],
+  ["Pillar warp (right half)", null],
+  ["!seam_warp.enabled", "seam_warp.enabled", "enabled"],
+  ["shift top", "seam_warp.dx.0.1", -80, 80, 0.5],
+  ["shift base", "seam_warp.dx.1.1", -80, 80, 0.5],
+  ["fade px", "seam_warp.fade_px", 1, 1500, 1],
+  ["Parallelogram (0 = off, 1 = opposite sides parallel)", null],
+  ["left half", "parallelogram.left", -0.5, 1.5, 0.01],
+  ["right half", "parallelogram.right", -0.5, 1.5, 0.01],
+  ["Corner pin: left half (px; x+ right, y+ down)", null],
+  ["BR (seam) x", "corner_pin.left.bottom_right.0", -1500, 1500, 1],
+  ["BR (seam) y", "corner_pin.left.bottom_right.1", -1500, 1500, 1],
+  ["BL x", "corner_pin.left.bottom_left.0", -1500, 1500, 1],
+  ["BL y", "corner_pin.left.bottom_left.1", -1500, 1500, 1],
+  ["TL x", "corner_pin.left.top_left.0", -800, 800, 1],
+  ["TL y", "corner_pin.left.top_left.1", -800, 800, 1],
+  ["Corner pin: right half (px; x+ right, y+ down)", null],
+  ["BL (seam) x", "corner_pin.right.bottom_left.0", -1500, 1500, 1],
+  ["BL (seam) y", "corner_pin.right.bottom_left.1", -1500, 1500, 1],
+  ["BR x", "corner_pin.right.bottom_right.0", -1500, 1500, 1],
+  ["BR y", "corner_pin.right.bottom_right.1", -1500, 1500, 1],
+  ["TR x", "corner_pin.right.top_right.0", -800, 800, 1],
+  ["TR y", "corner_pin.right.top_right.1", -800, 800, 1],
+];
+let CFG, P, IMG = {}, W = 3490, H = 1400;
+
+const get = (o, path) => path.split(".").reduce((a, k) => a[k], o);
+function set(o, path, v) { const ks = path.split("."); const last = ks.pop(); ks.reduce((a, k) => a[k], o)[last] = v; }
+
+const mul = (a, b) => [0, 1, 2].map(i => [0, 1, 2].map(j => a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]));
+function inv(m) {
+  const [a, b, c] = m[0], [d, e, f] = m[1], [g, h, i] = m[2];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+  return [[A / det, -(b * i - c * h) / det, (b * f - c * e) / det],
+          [B / det, (a * i - c * g) / det, -(a * f - c * d) / det],
+          [C / det, -(a * h - b * g) / det, (a * e - b * d) / det]];
+}
+const ap = (Hm, p) => { const x = Hm[0][0] * p[0] + Hm[0][1] * p[1] + Hm[0][2], y = Hm[1][0] * p[0] + Hm[1][1] * p[1] + Hm[1][2], z = Hm[2][0] * p[0] + Hm[2][1] * p[1] + Hm[2][2]; return [x / z, y / z]; };
+const I3 = () => [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+
+function undistort(pts, K, D, Pm, iters = 50) {  // K, Pm = {f, cx, cy}; D = [k1, k2, k3]
+  return pts.map(([px, py]) => {
+    const xd = (px - K.cx) / K.f, yd = (py - K.cy) / K.f;
+    let x = xd, y = yd;
+    for (let i = 0; i < iters; i++) { const r2 = x * x + y * y; const s = 1 + D[0] * r2 + D[1] * r2 * r2 + D[2] * r2 * r2 * r2; x = xd / s; y = yd / s; }
+    return [x * Pm.f + Pm.cx, y * Pm.f + Pm.cy];
+  });
+}
+function polyfit1(pts) {
+  const n = pts.length; let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const [x, y] of pts) { sx += x; sy += y; sxx += x * x; sxy += x * y; }
+  const m = (n * sxy - sx * sy) / (n * sxx - sx * sx); return [m, (sy - m * sx) / n];
+}
+function rotation(f, xs, cy, yaw, pitch, roll) {
+  const [y, p, r] = [yaw, pitch, roll].map(d => d * Math.PI / 180);
+  const Ry = [[Math.cos(y), 0, Math.sin(y)], [0, 1, 0], [-Math.sin(y), 0, Math.cos(y)]];
+  const Rx = [[1, 0, 0], [0, Math.cos(p), -Math.sin(p)], [0, Math.sin(p), Math.cos(p)]];
+  const Rz = [[Math.cos(r), -Math.sin(r), 0], [Math.sin(r), Math.cos(r), 0], [0, 0, 1]];
+  const Kp = [[f, 0, xs], [0, f, cy], [0, 0, 1]];
+  const Hr = mul(mul(mul(mul(Kp, Rz), Rx), Ry), inv(Kp));
+  const c = ap(Hr, [xs, cy]);
+  return mul([[1, 0, xs - c[0]], [0, 1, cy - c[1]], [0, 0, 1]], Hr);
+}
+const finite = M => M.every(r => r.every(Number.isFinite));
+
+function build(P) {
+  const eq = P.equipment, seam = P.seam, cy = eq.cy, D = [eq.k1, eq.k2, eq.k3];
+  const halves = { left: [0, seam], right: [seam, W] };
+  const base = {}; for (const s in halves) base[s] = CFG.baseline[s].map(([x, y]) => [x - halves[s][0], y]);
+  const hs = {};
+  for (const s in halves) {
+    const [x0, x1] = halves[s], w = x1 - x0, f = eq.f[s], xs = s === "left" ? w : 0;
+    const K = { f, cx: xs, cy };
+    const ends = undistort([[xs, 0], [xs, H - 1]], K, D, K);
+    const z = Math.max(cy / (cy - ends[0][1]), (H - cy) / (ends[1][1] - cy)) * eq.zoom;
+    const Pm = { f: f * z, cx: xs, cy };
+    const sign = s === "left" ? 1 : -1;
+    const h = { x0, w, K, Pm, D, Hm: rotation(f * z, xs, cy, sign * P.camera.yaw, P.camera.pitch, sign * P.camera.roll) };
+    const slope = polyfit1(halfPts(h, base[s]))[0] * P.shear;
+    const Hs = [[1, 0, 0], [-slope, 1, slope * xs], [0, 0, 1]];
+    if (finite(Hs)) h.Hm = mul(Hs, h.Hm);
+    hs[s] = h;
+  }
+  const seamY = s => { const [m, c] = polyfit1(halfPts(hs[s], base[s])); return m * (s === "left" ? hs[s].w : 0) + c; };
+  if (P.align) {
+    const yt = (seamY("left") + seamY("right")) / 2;
+    for (const s in hs) { const sc = (H - yt) / (H - seamY(s)); const M = [[1, 0, 0], [0, sc, H * (1 - sc)], [0, 0, 1]]; if (finite(M)) hs[s].Hm = mul(M, hs[s].Hm); }
+  }
+  if (P.collinear) {
+    const mid = {}; for (const s in hs) { const q = halfPts(hs[s], base[s]); mid[s] = [q.reduce((a, p) => a + p[0], 0) / q.length + hs[s].x0, q.reduce((a, p) => a + p[1], 0) / q.length]; }
+    const mc = (mid.right[1] - mid.left[1]) / (mid.right[0] - mid.left[0]);
+    for (const s in hs) {
+      const m = polyfit1(halfPts(hs[s], base[s]))[0], xs = s === "left" ? hs[s].w : 0, d = mc - m;
+      const M = [[1, 0, 0], [d, 1, -d * xs], [0, 0, 1]]; if (finite(M)) hs[s].Hm = mul(M, hs[s].Hm);
+    }
+  }
+  for (const s in hs) {
+    const pin = P.corner_pin[s], w = hs[s].w;
+    if (Object.values(pin).some(v => v[0] || v[1])) {
+      const src = [[0, 0], [w, 0], [w, H], [0, H]];
+      const off = [pin.top_left, pin.top_right, pin.bottom_right, pin.bottom_left];
+      const Hp = perspective(src, src.map((p, i) => [p[0] + off[i][0], p[1] + off[i][1]]));
+      if (finite(Hp)) hs[s].Hm = mul(Hp, hs[s].Hm);
+    }
+    const k = (P.parallelogram || {})[s] || 0;
+    if (k && CFG.lines && CFG.lines.near_wall) {
+      const h = hs[s], x0 = h.x0, xs = s === "left" ? h.w : 0;
+      const loc = pts => halfPts(h, pts.map(([x, y]) => [x - x0, y]));
+      const far = tls(loc(CFG.baseline[s])), near = tls(loc(CFG.lines.near_wall[s]));
+      const side = tls(loc(CFG.lines.side_wall[s])), zone = tls(loc(CFG.lines.zone_line[s]));
+      const hz = cross(cross(far, near), cross(side, zone));
+      const Hp = [[1, 0, 0], [0, 1, 0], [k * hz[0] / hz[2], k * hz[1] / hz[2], 1]];
+      const b = loc(CFG.baseline[s]);
+      let outer = b[0]; for (const q of b) if (Math.abs(q[0] - (h.w - xs)) < Math.abs(outer[0] - (h.w - xs))) outer = q;
+      const anchors = [[xs, cy], [xs, 0.8 * H], outer], moved = anchors.map(p => ap(Hp, p));
+      const A = affineFrom(moved, anchors), Mx = mul(A, Hp);
+      if (finite(Mx)) h.Hm = mul(Mx, h.Hm);
+    }
+    if (CFG.lines && CFG.lines.near_wall) {
+      const h = hs[s], x0 = h.x0, loc = pts => halfPts(h, pts.map(([x, y]) => [x - x0, y]));
+      const far = tls(loc(CFG.baseline[s])), side = tls(loc(CFG.lines.side_wall[s]));
+      const near = tls(loc(CFG.lines.near_wall[s])), zone = tls(loc(CFG.lines.zone_line[s]));
+      const src = [[far, side], [far, zone], [near, zone], [near, side]].map(([a, b]) => { const x = cross(a, b); return [x[0] / x[2], x[1] / x[2]]; });
+      h.quadSrc = src.map(([x, y]) => [x + x0, y]);
+      const q = P.quad && P.quad[s];
+      if (q) { const Hq = perspective(src, q.map(([x, y]) => [x - x0, y])); if (finite(Hq)) h.Hm = mul(Hq, h.Hm); }
+    }
+    hs[s].Hinv = inv(hs[s].Hm);
+  }
+  return { seam, hs, sw: P.seam_warp && P.seam_warp.enabled ? P.seam_warp : null };
+}
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+function tls(pts) {  // best-fit line (a, b, c), a x + b y + c = 0, unit normal; same as lens.py _tls_line
+  const n = pts.length, mx = pts.reduce((a, p) => a + p[0], 0) / n, my = pts.reduce((a, p) => a + p[1], 0) / n;
+  let sxx = 0, syy = 0, sxy = 0; for (const [x, y] of pts) { sxx += (x - mx) ** 2; syy += (y - my) ** 2; sxy += (x - mx) * (y - my); }
+  const th = 0.5 * Math.atan2(2 * sxy, sxx - syy), d = [Math.cos(th), Math.sin(th)], nn = [-d[1], d[0]];
+  return [nn[0], nn[1], -(nn[0] * mx + nn[1] * my)];
+}
+function affineFrom(src, dst) {  // 3 point pairs -> 3x3 affine
+  const S = [[src[0][0], src[0][1], 1], [src[1][0], src[1][1], 1], [src[2][0], src[2][1], 1]], Si = inv(S);
+  const col = j => [0, 1, 2].map(i => Si[i][0] * dst[0][j] + Si[i][1] * dst[1][j] + Si[i][2] * dst[2][j]);
+  const a = col(0), b = col(1); return [[a[0], a[1], a[2]], [b[0], b[1], b[2]], [0, 0, 1]];
+}
+function perspective(src, dst) {  // 4 point pairs -> 3x3 (same as cv2.getPerspectiveTransform)
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  for (let c = 0; c < 8; c++) {  // Gaussian elimination with partial pivoting
+    let piv = c; for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+    [A[c], A[piv]] = [A[piv], A[c]]; [b[c], b[piv]] = [b[piv], b[c]];
+    for (let r = 0; r < 8; r++) if (r !== c) { const k = A[r][c] / A[c][c]; for (let j = c; j < 8; j++) A[r][j] -= k * A[c][j]; b[r] -= k * b[c]; }
+  }
+  const h = b.map((v, i) => v / A[i][i]);
+  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
+}
+function halfPts(h, pts) { return undistort(pts, h.K, h.D, h.Pm).map(p => ap(h.Hm, p)); }
+function swOffsets(x, y, seam, sw) {
+  const [lt, rt] = sw.pad_top, [lb, rb] = sw.base, sc = (lb - lt) / (rb - rt), sy = rt + (y - lt) / sc;
+  const [[y0, d0], [y1, d1]] = sw.dx, dx = d0 + (d1 - d0) * Math.min(1, Math.max(0, (y - y0) / (y1 - y0)));
+  const wx = x >= seam ? Math.min(1, Math.max(0, 1 - (x - seam) / sw.fade_px)) : 0;
+  const [r0, r1] = sw.rows, w = wx * Math.min(1, Math.max(0, (r1 - y) / (r1 - r0)));
+  return [-w * dx, w * (sy - y)];
+}
+function lensPoints(M, pts) {  // source full-frame -> corrected full-frame
+  return pts.map(([x, y]) => {
+    const s = x < M.seam ? "left" : "right", h = M.hs[s];
+    let [u, v] = halfPts(h, [[x - h.x0, y]])[0]; u += h.x0;
+    if (M.sw) { let ox = u, oy = v; for (let i = 0; i < 20; i++) { const [dx, dy] = swOffsets(ox, oy, M.seam, M.sw); ox = u - dx; oy = v - dy; } u = ox; v = oy; }
+    return [u, v];
+  });
+}
+
+// ---------- WebGL ----------
+const gl = document.getElementById("gl").getContext("webgl", { preserveDrawingBuffer: true });
+const VS = `attribute vec2 a; void main(){ gl_Position = vec4(a, 0., 1.); }`;
+const FS = `precision highp float;
+uniform sampler2D uTex; uniform vec2 uSize, uCanvas; uniform vec3 uView; uniform float uSeam;
+uniform mat3 uHinvL, uHinvR; uniform vec3 uKL, uKR, uPL, uPR, uD; uniform vec2 uWidths;
+uniform float uSwOn, uOutside; uniform vec4 uSw1, uSw2; uniform vec3 uSw3;
+void main(){
+  vec2 fc = vec2(gl_FragCoord.x, uCanvas.y - gl_FragCoord.y);
+  vec2 o = uView.xy + fc / uView.z;
+  bool inFrame = !(o.x < 0. || o.y < 0. || o.x >= uSize.x || o.y >= uSize.y);
+  if (!inFrame && uOutside < .5) { gl_FragColor = vec4(.08, .08, .09, 1.); return; }
+  vec2 q = o;
+  if (uSwOn > .5 && o.x >= uSeam && inFrame) {
+    float sc = (uSw1.z - uSw1.x) / (uSw1.w - uSw1.y);
+    float sy = uSw1.y + (o.y - uSw1.x) / sc;
+    float dxv = uSw2.y + (uSw2.w - uSw2.y) * clamp((o.y - uSw2.x) / (uSw2.z - uSw2.x), 0., 1.);
+    float wx = clamp(1. - (o.x - uSeam) / uSw3.x, 0., 1.);
+    float w = wx * clamp((uSw3.z - o.y) / (uSw3.z - uSw3.y), 0., 1.);
+    q = o + vec2(-w * dxv, w * (sy - o.y));
+    q.x = max(q.x, uSeam);
+    q = clamp(q, vec2(0.), uSize - 1.);
+  }
+  bool left = q.x < uSeam;
+  vec2 l = left ? q : q - vec2(uSeam, 0.);
+  vec3 p = (left ? uHinvL : uHinvR) * vec3(l, 1.); p.xy /= p.z;
+  float w = left ? uWidths.x : uWidths.y;
+  if (p.z <= 0. || p.x < 0. || p.y < 0. || p.x > w - 1. || p.y > uSize.y - 1.) { gl_FragColor = vec4(0., 0., 0., 1.); return; }
+  vec3 K = left ? uKL : uKR; vec3 Pm = left ? uPL : uPR;
+  vec2 x = (p.xy - Pm.yz) / Pm.x; float r2 = dot(x, x);
+  vec2 s = K.yz + K.x * x * (1. + uD.x * r2 + uD.y * r2 * r2 + uD.z * r2 * r2 * r2);
+  if (s.x >= 0. && !left) s.x += uSeam;
+  if (s.x < 0. || s.y < 0. || s.x >= uSize.x || s.y >= uSize.y) { gl_FragColor = vec4(0., 0., 0., 1.); return; }
+  gl_FragColor = texture2D(uTex, (s + .5) / uSize);
+}`;
+function shader(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s); return s; }
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS)); gl.linkProgram(prog); gl.useProgram(prog);
+const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, "a"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+const U = n => gl.getUniformLocation(prog, n);
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+
+// ---------- view / overlays ----------
+const glc = document.getElementById("gl"), ov = document.getElementById("ov"), ctx = ov.getContext("2d"), stage = document.getElementById("stage");
+let view = { x: 0, y: 0, s: 0.4 }, rulers = [], drag = null, M = null;
+const show = { "far baseline": true };
+function fit() { view.s = Math.min(stage.clientWidth / W, stage.clientHeight / H); view.x = -(stage.clientWidth / view.s - W) / 2; view.y = -(stage.clientHeight / view.s - H) / 2; }
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  for (const c of [glc, ov]) { c.width = stage.clientWidth * dpr; c.height = stage.clientHeight * dpr; c.style.width = stage.clientWidth + "px"; c.style.height = stage.clientHeight + "px"; }
+  render();
+}
+const toScreen = ([x, y]) => [(x - view.x) * view.s, (y - view.y) * view.s];
+const toWorld = (sx, sy) => [view.x + sx / view.s, view.y + sy / view.s];
+
+function fitLine(pts) {
+  const n = pts.length, mx = pts.reduce((a, p) => a + p[0], 0) / n, my = pts.reduce((a, p) => a + p[1], 0) / n;
+  let sxx = 0, syy = 0, sxy = 0; for (const [x, y] of pts) { sxx += (x - mx) ** 2; syy += (y - my) ** 2; sxy += (x - mx) * (y - my); }
+  const th = 0.5 * Math.atan2(2 * sxy, sxx - syy), d = [Math.cos(th), Math.sin(th)];
+  const t = pts.map(([x, y]) => (x - mx) * d[0] + (y - my) * d[1]), e = pts.map(([x, y]) => -(x - mx) * d[1] + (y - my) * d[0]);
+  let ang = th * 180 / Math.PI; ang = ((ang + 90) % 180 + 180) % 180 - 90;
+  return { m: [mx, my], d, t0: Math.min(...t), t1: Math.max(...t), angle: Math.abs(ang), bend: Math.sqrt(e.reduce((a, v) => a + v * v, 0) / n) };
+}
+
+function render() {
+  if (!M) return;
+  const dpr = window.devicePixelRatio || 1;
+  gl.viewport(0, 0, glc.width, glc.height);
+  gl.uniform2f(U("uSize"), W, H); gl.uniform2f(U("uCanvas"), glc.width, glc.height);
+  gl.uniform3f(U("uView"), view.x, view.y, view.s * dpr); gl.uniform1f(U("uSeam"), M.seam);
+  const L = M.hs.left, R = M.hs.right, T = m => [m[0][0], m[1][0], m[2][0], m[0][1], m[1][1], m[2][1], m[0][2], m[1][2], m[2][2]];
+  gl.uniformMatrix3fv(U("uHinvL"), false, T(L.Hinv)); gl.uniformMatrix3fv(U("uHinvR"), false, T(R.Hinv));
+  gl.uniform3f(U("uKL"), L.K.f, L.K.cx, L.K.cy); gl.uniform3f(U("uKR"), R.K.f, R.K.cx, R.K.cy);
+  gl.uniform3f(U("uPL"), L.Pm.f, L.Pm.cx, L.Pm.cy); gl.uniform3f(U("uPR"), R.Pm.f, R.Pm.cx, R.Pm.cy);
+  gl.uniform3f(U("uD"), ...L.D); gl.uniform2f(U("uWidths"), L.w, R.w);
+  const sw = M.sw; gl.uniform1f(U("uSwOn"), sw ? 1 : 0); gl.uniform1f(U("uOutside"), show.__outside ? 1 : 0);
+  if (sw) { gl.uniform4f(U("uSw1"), sw.pad_top[0], sw.pad_top[1], sw.base[0], sw.base[1]); gl.uniform4f(U("uSw2"), sw.dx[0][0], sw.dx[0][1], sw.dx[1][0], sw.dx[1][1]); gl.uniform3f(U("uSw3"), sw.fade_px, sw.rows[0], sw.rows[1]); }
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  drawOverlay();
+}
+
+function drawOverlay() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, ov.width, ov.height);
+  const stats = [];
+  const sets = [["far baseline", "#ff4dff", [CFG.baseline.left.concat(CFG.baseline.right)]]];
+  for (const [name, f] of Object.entries(CFG.features)) sets.push([name, f.color, f.lines]);
+  for (const [name, color, lines] of sets) {
+    if (!show[name]) continue;
+    lines.forEach((ln, i) => {
+      const pts = lensPoints(M, ln).filter(p => p.every(Number.isFinite));
+      if (pts.length < 2) return;
+      const L = fitLine(pts), a = toScreen([L.m[0] + L.d[0] * (L.t0 - 200), L.m[1] + L.d[1] * (L.t0 - 200)]), b = toScreen([L.m[0] + L.d[0] * (L.t1 + 200), L.m[1] + L.d[1] * (L.t1 + 200)]);
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+      ctx.fillStyle = color; for (const p of pts) { const [x, y] = toScreen(p); ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 7); ctx.fill(); }
+      const side = lines.length > 1 ? (i === 0 ? " L" : " R") : "";
+      stats.push(`${(name.split(" (")[0] + side).padEnd(18)} angle ${L.angle.toFixed(1).padStart(5)}°  bend ${L.bend.toFixed(1).padStart(5)}px`);
+    });
+  }
+  if (show.__quad) for (const s of ["left", "right"]) {
+    const q = quadPts(s); if (!q) continue;
+    ctx.strokeStyle = s === "left" ? "#ffe066" : "#ff9ff3"; ctx.lineWidth = 2; ctx.beginPath();
+    q.forEach((p, i) => { const [x, y] = toScreen(p); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.closePath(); ctx.stroke();
+    q.forEach((p, i) => { const [x, y] = toScreen(p); ctx.fillStyle = ctx.strokeStyle; ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.fill();
+      ctx.fillStyle = "#000"; ctx.font = "bold 10px system-ui"; ctx.fillText(String(i + 1), x - 3, y + 4); });
+  }
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+  for (const r of rulers.concat(drag && drag.ruler ? [drag.ruler] : [])) { ctx.beginPath(); ctx.moveTo(...toScreen(r[0])); ctx.lineTo(...toScreen(r[1])); ctx.stroke(); }
+  ctx.setLineDash([]);
+  if (show.__outside) { const a = toScreen([0, 0]), b = toScreen([W, H]); ctx.strokeStyle = "#ffffffaa"; ctx.setLineDash([4, 4]); ctx.strokeRect(a[0], a[1], b[0] - a[0], b[1] - a[1]); ctx.setLineDash([]); }
+  const sx = toScreen([M.seam, 0])[0]; ctx.strokeStyle = "#ffd60066"; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, 14); ctx.stroke();
+  document.getElementById("stats").textContent = stats.join("\n");
+}
+
+function quadPts(s) { return (P.quad && P.quad[s]) || (M.hs[s] && M.hs[s].quadSrc); }
+function hitHandle(sx, sy) {
+  if (!show.__quad) return null;
+  for (const s of ["left", "right"]) { const q = quadPts(s); if (!q) continue;
+    for (let i = 0; i < 4; i++) { const [x, y] = toScreen(q[i]); if (Math.hypot(x - sx, y - sy) < 12) return { s, i }; } }
+  return null;
+}
+
+// ---------- UI ----------
+function buildControls() {
+  const box = document.getElementById("controls"); box.innerHTML = "";
+  for (const s of SPEC) {
+    if (s[1] === null) { const h = document.createElement("h2"); h.textContent = s[0]; box.appendChild(h); continue; }
+    if (s[0].startsWith("!")) {
+      const d = document.createElement("label"); d.className = "chk";
+      d.innerHTML = `<input type="checkbox"> ${s[2]}`; const c = d.querySelector("input");
+      c.checked = !!get(P, s[1]); c.onchange = () => { set(P, s[1], c.checked); update(); };
+      box.appendChild(d); continue;
+    }
+    const [label, path, min, max, step] = s, row = document.createElement("div"); row.className = "row";
+    row.innerHTML = `<label title="${path}">${label}</label><input type="range" min="${min}" max="${max}" step="${step}"><input type="number" step="${step}">`;
+    const [r, n] = row.querySelectorAll("input"); r.value = n.value = get(P, path);
+    r.oninput = () => { n.value = r.value; set(P, path, +r.value); update(); };
+    n.onchange = () => { r.value = n.value; set(P, path, +n.value); update(); };
+    box.appendChild(row);
+  }
+  const ovb = document.getElementById("overlays"); ovb.innerHTML = "";
+  { if (show.__quad === undefined) show.__quad = true;
+    const d = document.createElement("label"); d.className = "chk"; d.innerHTML = `<input type="checkbox"> corner handles (drag 1–4 on each half)`;
+    const c = d.querySelector("input"); c.checked = show.__quad; c.onchange = () => { show.__quad = c.checked; drawOverlay(); }; ovb.appendChild(d);
+    const b = document.createElement("div"); b.className = "btns";
+    for (const s of ["left", "right"]) { const btn = document.createElement("button"); btn.textContent = `reset ${s} corners`; btn.onclick = () => { P.quad[s] = null; update(); }; b.appendChild(btn); }
+    ovb.appendChild(b); }
+  { const d = document.createElement("label"); d.className = "chk"; d.innerHTML = `<input type="checkbox"> show beyond the frame edges (zoom out)`;
+    const c = d.querySelector("input"); c.checked = !!show.__outside; c.onchange = () => { show.__outside = c.checked; render(); }; ovb.appendChild(d); }
+  for (const [name, color] of [["far baseline", "#ff4dff"], ...Object.entries(CFG.features).map(([k, f]) => [k, f.color])]) {
+    if (!(name in show)) show[name] = true;
+    const d = document.createElement("label"); d.className = "chk";
+    d.innerHTML = `<input type="checkbox"> <span style="color:${color}">■</span> ${name}`;
+    const c = d.querySelector("input"); c.checked = show[name]; c.onchange = () => { show[name] = c.checked; drawOverlay(); };
+    ovb.appendChild(d);
+  }
+}
+let pending = false;
+function update() { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; try { M = build(P); render(); setStatus(""); } catch (e) { setStatus("model error: " + e, true); } }); }
+function setStatus(t, err) { const s = document.getElementById("status"); s.textContent = t; s.style.color = err ? "#ff6b6b" : "#6fdc8c"; }
+
+function loadImage(name) {
+  const im = new Image(); im.onload = () => { gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, im); render(); };
+  im.src = name;
+}
+async function loadConfig() {
+  CFG = await (await fetch("config")).json();
+  [W, H] = CFG.size;
+  P = JSON.parse(JSON.stringify({ equipment: CFG.equipment, seam: CFG.seam, shear: CFG.shear, align: CFG.align, collinear: CFG.collinear, camera: CFG.camera, seam_warp: CFG.seam_warp, corner_pin: CFG.corner_pin, parallelogram: CFG.parallelogram, quad: CFG.quad || { left: null, right: null } }));
+  for (const k of ["k2", "k3", "zoom"]) if (P.equipment[k] === undefined) P.equipment[k] = k === "zoom" ? 1 : 0;
+  buildControls(); M = build(P);
+}
+document.getElementById("revert").onclick = async () => { await loadConfig(); render(); setStatus("reverted to saved"); };
+document.getElementById("save").onclick = async () => {
+  const r = await fetch("save", { method: "POST", body: JSON.stringify(P) });
+  const j = await r.json(); setStatus(r.ok ? `saved → ${j.saved}, rebuilt ${j.lens} (baseline ${j.baseline_rms.toFixed(2)}px)` : "save failed", !r.ok);
+};
+document.getElementById("image").onchange = e => loadImage(e.target.value);
+
+ov.addEventListener("contextmenu", e => e.preventDefault());
+ov.addEventListener("mousedown", e => {
+  const w = toWorld(e.offsetX, e.offsetY), hit = e.button === 0 && !e.shiftKey && hitHandle(e.offsetX, e.offsetY);
+  if (hit) { P.quad[hit.s] = quadPts(hit.s).map(p => p.slice()); drag = { handle: hit }; return; }
+  drag = (e.shiftKey || e.button !== 0) ? { pan: true, sx: e.offsetX, sy: e.offsetY, vx: view.x, vy: view.y } : { ruler: [w, w] };
+});
+window.addEventListener("mousemove", e => {
+  if (!drag) return;
+  const r = ov.getBoundingClientRect(), ox = e.clientX - r.left, oy = e.clientY - r.top;
+  if (drag.handle) { P.quad[drag.handle.s][drag.handle.i] = toWorld(ox, oy); update(); return; }
+  if (drag.pan) { view.x = drag.vx - (ox - drag.sx) / view.s; view.y = drag.vy - (oy - drag.sy) / view.s; render(); }
+  else { drag.ruler[1] = toWorld(ox, oy); drawOverlay(); }
+});
+window.addEventListener("mouseup", () => { if (drag && drag.ruler && Math.hypot(drag.ruler[1][0] - drag.ruler[0][0], drag.ruler[1][1] - drag.ruler[0][1]) > 5) rulers.push(drag.ruler); drag = null; drawOverlay(); });
+ov.addEventListener("wheel", e => {
+  e.preventDefault(); const w = toWorld(e.offsetX, e.offsetY), k = Math.exp(-e.deltaY * 0.0015);
+  view.s *= k; view.x = w[0] - e.offsetX / view.s; view.y = w[1] - e.offsetY / view.s; render();
+}, { passive: false });
+ov.addEventListener("dblclick", () => { fit(); render(); });
+window.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "Backspace") { rulers.pop(); drawOverlay(); } else if (e.key === "c" || e.key === "C") { rulers = []; drawOverlay(); }
+});
+window.addEventListener("resize", resize);
+
+(async () => {
+  await loadConfig();
+  const sel = document.getElementById("image");
+  for (const n of CFG.images) { const o = document.createElement("option"); o.value = n; o.textContent = n.replace(".jpg", ""); sel.appendChild(o); }
+  fit(); resize(); loadImage(CFG.images[0]);
+})();
+</script>
+</body>
+</html>

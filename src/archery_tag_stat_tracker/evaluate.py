@@ -84,7 +84,7 @@ def score_arrows(flights: list, labels: list, t_max: float, lag=(-0.05, 0.6), **
         "recall": tp / max(1, len(labels)), "precision": tp / max(1, len(shots)),
         "missed": [labels[i] for i in range(len(labels)) if i not in used_l],
         "false": [shots[i] for i in range(len(shots)) if i not in used_s],
-        "lags": [round(dt, 2) for *_, dt in matched],
+        "lags": [round(dt, 2) for *_, dt in matched], "matched": matched, "shots": shots,
     }
 
 

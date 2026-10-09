@@ -8,7 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .arrows import ZONE_LEFT, ZONE_RIGHT, dedupe, edge_x, is_shot
+from . import arrows
+from .arrows import dedupe, edge_x, is_shot
 
 L_SH, R_SH = 5, 6
 LOOKBACK_S = 0.6  # how long before the first arrow blob the release may be
@@ -17,8 +18,8 @@ MAX_AHEAD = 0.5  # shooter may sit at most this many heights *past* the flight s
 
 
 def zone_mid(y):
-    y = max(y, ZONE_LEFT[0][1])
-    return (edge_x(ZONE_LEFT, y) + edge_x(ZONE_RIGHT, y)) / 2
+    y = max(y, arrows.ZONE_LEFT[0][1])
+    return (edge_x(arrows.ZONE_LEFT, y) + edge_x(arrows.ZONE_RIGHT, y)) / 2
 
 
 def upper_body(kp, box):

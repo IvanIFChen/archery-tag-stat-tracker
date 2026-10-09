@@ -13,7 +13,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .arrows import ZONE_LEFT, ZONE_RIGHT, dedupe, is_shot
+from . import arrows
+from .arrows import dedupe, is_shot
 
 
 def read(cap, fps, t0, t1, step=1):
@@ -51,10 +52,10 @@ def render(video: Path, t: float, crop, window=(-0.1, 0.7), flights=(), label=No
     timed = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     for img in (still, exp, timed):
-        for edge in (ZONE_LEFT, ZONE_RIGHT):
+        for edge in (arrows.ZONE_LEFT, arrows.ZONE_RIGHT):
             cv2.line(img, *[tuple(map(int, p)) for p in edge], (255, 255, 255), 2, cv2.LINE_AA)
     if label:
-        cv2.circle(still, (label["x"], label["y"]), 40, (0, 0, 255), 4, cv2.LINE_AA)
+        cv2.circle(still, (int(label["x"]), int(label["y"])), 40, (0, 0, 255), 4, cv2.LINE_AA)
     for fl in flights:
         pts = np.array([p[1:] for p in fl["pts"]], np.int32)
         for img in (exp, timed):
@@ -78,11 +79,14 @@ def main() -> None:
     p.add_argument("--crop", default="900,0,2750,1000", help="x0,y0,x1,y1 in source pixels")
     p.add_argument("--arrows", type=Path, help="arrows.py output; draws flights in the window")
     p.add_argument("--labels", type=Path, help="circles the labeled shooter nearest t")
+    p.add_argument("--geometry", type=Path, help="arrows.configure() JSON, for corrected video")
     p.add_argument("--title", default="")
     p.add_argument("--scale", type=float, default=0.5)
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args()
 
+    if a.geometry:
+        arrows.configure(json.loads(a.geometry.read_text()))
     crop = tuple(map(int, a.crop.split(",")))
     window = (-0.1, 0.7)
     flights = []

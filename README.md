@@ -21,6 +21,11 @@ _Last updated: 2026-10-08_
 
 ## Results
 
+> **New: [lens-variant report](docs/lens_variants_report.md).** It compares five lens corrections (plus a resampling control) by the arrow flights they produce:
+> - **T4** gives the cleanest gravity arcs (1.6‰ vs 2.3–3.1‰) and the longest flights.
+> - Detection should still run on the original pixels, because resampling alone drops ~25% of arrows.
+
+
 Ground truth: every shot in the first 60 s of the sample clip, hand-labeled with the [labeling page](#labeling-ground-truth). That's **35 shots** ([`data/labels_0-60s.json`](data/labels_0-60s.json)).
 
 A detected shot counts as correct if it is within **±0.6 s** of a labeled release **and** the label click falls inside the shooter's box (grown by 30%). Each label can be matched to at most one detection.

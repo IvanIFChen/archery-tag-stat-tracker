@@ -42,6 +42,19 @@ def edge_x(edge, y):
     return xa + (xb - xa) * (y - ya) / (yb - ya)
 
 
+def configure(geometry: dict | None) -> None:
+    """Override the frame geometry (for running on lens-corrected video):
+    {"band": [x0, x1], "zone_left": [[x, y], [x, y]], "zone_right": [...],
+     "height_at_y": [[y, h], ...]}."""
+    global BAND, ZONE_LEFT, ZONE_RIGHT, HEIGHT_AT_Y
+    if not geometry:
+        return
+    BAND = tuple(int(v) for v in geometry["band"])
+    ZONE_LEFT = tuple(tuple(v) for v in geometry["zone_left"])
+    ZONE_RIGHT = tuple(tuple(v) for v in geometry["zone_right"])
+    HEIGHT_AT_Y = tuple(tuple(v) for v in geometry["height_at_y"])
+
+
 def player_height(y):
     ys, hs = zip(*HEIGHT_AT_Y)
     return float(np.interp(y, ys, hs))
@@ -101,7 +114,7 @@ def person_boxes(tracks: Path | None) -> dict:
     return out
 
 
-def collect(video: Path, start: float, duration: float, boxes: dict):
+def collect(video: Path, start: float, duration: float, boxes: dict, frame_fn=None):
     """Per-frame fast-mover blobs, (n, 3) arrays of x, y, area; blobs on players dropped."""
     cap = cv2.VideoCapture(str(video))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -112,6 +125,8 @@ def collect(video: Path, start: float, duration: float, boxes: dict):
         ok, img = cap.read()
         if not ok:
             break
+        if frame_fn is not None:  # e.g. lens correction, applied before differencing
+            img = frame_fn(img)
         buf.append(cv2.cvtColor(img[:, BAND[0]:BAND[1]], cv2.COLOR_BGR2GRAY))
         if len(buf) < 5:
             continue
@@ -178,8 +193,8 @@ def link(frames: list, f0: int) -> list:
     return flights
 
 
-def track(video: Path, start: float, duration: float, tracks: Path | None = None):
-    fps, f0, frames = collect(video, start, duration, person_boxes(tracks))
+def track(video: Path, start: float, duration: float, tracks: Path | None = None, frame_fn=None):
+    fps, f0, frames = collect(video, start, duration, person_boxes(tracks), frame_fn)
     return fps, link(frames, f0)
 
 
@@ -211,8 +226,11 @@ def main() -> None:
     p.add_argument("--start", type=float, default=0.0)
     p.add_argument("--duration", type=float, default=60.0)
     p.add_argument("--tracks", type=Path, help="track.py output; blobs on players are ignored")
+    p.add_argument("--geometry", type=Path, help="JSON from configure(); for lens-corrected video")
     p.add_argument("--out", type=Path, default=Path("out/arrows.json"))
     a = p.parse_args()
+    if a.geometry:
+        configure(json.loads(a.geometry.read_text()))
     fps, flights = track(a.video, a.start, a.duration, a.tracks)
     summ = [fl.summary(fps) for fl in flights if len(fl.pts) >= MIN_POINTS]
     shots = [s for s in summ if is_shot(s)]

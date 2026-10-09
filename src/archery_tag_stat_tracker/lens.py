@@ -32,9 +32,75 @@ import numpy as np
 
 EQUIPMENT = {
     "k1": 0.2,  # radial term (positive: the stitcher over-dewarped each half)
+    "k2": 0.0,  # 4th-order radial term: acts mostly far from the lens center (bottom corners)
+    "k3": 0.0,  # 6th-order radial term
     "f": {"left": 1822.0, "right": 1668.0},  # px, at the 3490x1400 stitched scale
     "cy": 190.0,  # lens-center height (on the far baseline row)
+    "zoom": 1.0,  # extra zoom on top of "seam column fills the height"
 }
+# Stitch-profile keys and their defaults (see data/stitch/*.json). A profile may
+# also carry an "equipment" dict that overrides EQUIPMENT (set by the lens tool).
+STITCH_DEFAULTS = {
+    "shear": 0.6,  # fraction of each half's far-baseline slope removed
+    "align": True,  # stretch halves so the baselines meet at the seam
+    "collinear": True,  # shear halves so both baseline segments lie on one line
+    "camera": {"yaw": 0.0, "pitch": 0.0, "roll": 0.0},  # deg; mirrored on the right half
+    # Corner pin: move a half's output corners by (dx, dy) px; the half is warped
+    # by the perspective transform that takes its rectangle to the moved corners.
+    "corner_pin": {s: {c: [0.0, 0.0] for c in ("top_left", "top_right", "bottom_left", "bottom_right")}
+                   for s in ("left", "right")},
+    # Parallelogram: per half, 0 = off .. 1 = make the half-court outline (far
+    # baseline / side wall / near wall / zone line) have parallel opposite sides,
+    # by sending both of its vanishing points to infinity. Needs profile "lines".
+    "parallelogram": {"left": 0.0, "right": 0.0},
+    # Quad pin: per half, where the 4 half-court corners (far x side, far x zone,
+    # near x zone, near x side; full-frame output px) should end up. null = leave.
+    "quad": {"left": None, "right": None},
+}
+
+
+def _tls_line(p):
+    """Best-fit line through points as (a, b, c) with a x + b y + c = 0, (a, b) unit."""
+    p = np.asarray(p, float)
+    m = p.mean(0)
+    d = np.linalg.svd(p - m, full_matrices=False)[2][0]
+    n = np.array([-d[1], d[0]])
+    return np.array([n[0], n[1], -n @ m])
+
+
+def quad_corners(st: dict, h, side: str):
+    """Half-local corrected corners of the half-court outline, in the order
+    far x side, far x zone, near x zone, near x side."""
+    loc = lambda pts: h.points(np.asarray(pts, float) - [h.x0, 0])
+    L = st["lines"]
+    far, wall = _tls_line(loc(st["baseline"][side])), _tls_line(loc(L["side_wall"][side]))
+    near, zone = _tls_line(loc(L["near_wall"][side])), _tls_line(loc(L["zone_line"][side]))
+    out = []
+    for a, b in ((far, wall), (far, zone), (near, zone), (near, wall)):
+        x = np.cross(a, b)
+        out.append(x[:2] / x[2])
+    return out
+
+
+def _affine_from(src, dst):
+    """3 point pairs -> 3x3 affine."""
+    A = np.column_stack([np.asarray(src, float), np.ones(3)])
+    X = np.linalg.solve(A, np.asarray(dst, float))
+    return np.vstack([X.T, [0, 0, 1]])
+
+
+def undistort(p, K, D, P, iters=50):
+    """Distorted pixels -> undistorted pixels (radial k1, k2, k3 only). Same
+    fixed-point iteration as OpenCV's undistortPoints, run longer; lens_tool.html
+    uses the identical loop so the browser and the pipeline agree."""
+    p = np.asarray(p, float).reshape(-1, 2)
+    k1, k2, k3 = D[0], D[1], (D[4] if len(D) > 4 else 0.0)
+    xd = (p - K[:2, 2]) / K[0, 0]
+    x = xd.copy()
+    for _ in range(iters):
+        r2 = (x ** 2).sum(1, keepdims=True)
+        x = xd / (1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3)
+    return x * P[0, 0] + P[:2, 2]
 
 
 def find_seam(video: Path, n: int = 30, search=(0.35, 0.65)) -> int:
@@ -71,7 +137,7 @@ class Half:
 
     def points(self, p):
         """Source (half-local) -> corrected (half-local)."""
-        u = cv2.undistortPoints(np.asarray(p, float).reshape(-1, 1, 2), self.K, self.D, P=self.P).reshape(-1, 2)
+        u = undistort(p, self.K, self.D, self.P)
         return _apply(self.Hm, u)
 
     def maps(self):
@@ -149,26 +215,43 @@ class Lens:
         return cv2.remap(img, *self._maps, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
 
+def _rotation(f, xs, cy, yaw, pitch, roll):
+    """Turn the virtual camera about its lens center (kept fixed, so halves still meet)."""
+    y, p, r = np.radians([yaw, pitch, roll])
+    Ry = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    Rx = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    Rz = np.array([[np.cos(r), -np.sin(r), 0], [np.sin(r), np.cos(r), 0], [0, 0, 1]])
+    Kp = np.array([[f, 0, xs], [0, f, cy], [0, 0, 1]])
+    Hr = Kp @ Rz @ Rx @ Ry @ np.linalg.inv(Kp)
+    c = Hr @ np.array([xs, cy, 1.0])
+    return np.array([[1, 0, xs - c[0] / c[2]], [0, 1, cy - c[1] / c[2]], [0, 0, 1]]) @ Hr
+
+
 def build(stitch: dict, size=(3490, 1400)) -> Lens:
-    """EQUIPMENT + a per-video stitch profile -> Lens."""
+    """EQUIPMENT (+ profile overrides) + a per-video stitch profile -> Lens.
+    Keep in sync with lens_tool.html, which runs the same model in the browser."""
     W, H = size
-    seam = stitch["seam"]
+    st = {**STITCH_DEFAULTS, **stitch}
+    eq = {**EQUIPMENT, **stitch.get("equipment", {})}
+    cam = {**STITCH_DEFAULTS["camera"], **st.get("camera", {})}
+    seam = st["seam"]
     halves = {"left": (0, seam), "right": (seam, W)}
-    k1, cy = EQUIPMENT["k1"], EQUIPMENT["cy"]
-    base = {s: np.array(stitch["baseline"][s], float) - [x0, 0] for s, (x0, _) in halves.items()}
+    cy = eq["cy"]
+    base = {s: np.array(st["baseline"][s], float) - [x0, 0] for s, (x0, _) in halves.items()}
     hs = {}
     for s, (x0, x1) in halves.items():
-        w, f = x1 - x0, EQUIPMENT["f"][s]
+        w, f = x1 - x0, eq["f"][s]
         xs = float(w) if s == "left" else 0.0
         K = np.array([[f, 0, xs], [0, f, cy], [0, 0, 1]], float)
-        D = np.array([k1, 0, 0, 0], float)
-        ends = cv2.undistortPoints(np.array([[[xs, 0.0]], [[xs, H - 1.0]]]), K, D, P=K).reshape(2, 2)
-        z = max(cy / (cy - ends[0, 1]), (H - cy) / (ends[1, 1] - cy))
+        D = np.array([eq["k1"], eq["k2"], 0, 0, eq["k3"]], float)
+        ends = undistort([[xs, 0.0], [xs, H - 1.0]], K, D, K)
+        z = max(cy / (cy - ends[0, 1]), (H - cy) / (ends[1, 1] - cy)) * eq["zoom"]
         P = K.copy()
         P[0, 0] = P[1, 1] = f * z
-        h = Half(x0, w, H, K, D, P, np.eye(3))
-        slope = np.polyfit(*h.points(base[s]).T, 1)[0] * stitch["shear"]
-        h.Hm = np.array([[1, 0, 0], [-slope, 1, slope * xs], [0, 0, 1]])
+        sign = 1 if s == "left" else -1
+        h = Half(x0, w, H, K, D, P, _rotation(f * z, xs, cy, sign * cam["yaw"], cam["pitch"], sign * cam["roll"]))
+        slope = np.polyfit(*h.points(base[s]).T, 1)[0] * st["shear"]
+        h.Hm = np.array([[1, 0, 0], [-slope, 1, slope * xs], [0, 0, 1]]) @ h.Hm
         hs[s] = h
 
     def seam_y(s):
@@ -176,19 +259,53 @@ def build(stitch: dict, size=(3490, 1400)) -> Lens:
         m, c = np.polyfit(*h.points(base[s]).T, 1)
         return m * (h.w if s == "left" else 0.0) + c
 
-    # stretch each half vertically about the seam bottom so the baselines meet
-    yt = (seam_y("left") + seam_y("right")) / 2
+    if st["align"]:  # stretch each half vertically about the seam bottom so the baselines meet
+        yt = (seam_y("left") + seam_y("right")) / 2
+        for s, h in hs.items():
+            sc = (H - yt) / (H - seam_y(s))
+            h.Hm = np.array([[1, 0, 0], [0, sc, H * (1 - sc)], [0, 0, 1]]) @ h.Hm
+    if st["collinear"]:  # shear each half about the seam so both segments lie on one line
+        mids = {s: h.points(base[s]).mean(0) + [h.x0, 0] for s, h in hs.items()}
+        mc = (mids["right"][1] - mids["left"][1]) / (mids["right"][0] - mids["left"][0])
+        for s, h in hs.items():
+            m = np.polyfit(*h.points(base[s]).T, 1)[0]
+            xs = float(h.w) if s == "left" else 0.0
+            h.Hm = np.array([[1, 0, 0], [mc - m, 1, -(mc - m) * xs], [0, 0, 1]]) @ h.Hm
+    pins = st.get("corner_pin") or {}
     for s, h in hs.items():
-        sc = (H - yt) / (H - seam_y(s))
-        h.Hm = np.array([[1, 0, 0], [0, sc, H * (1 - sc)], [0, 0, 1]]) @ h.Hm
-    # then shear each half about the seam so both segments lie on one line
-    mids = {s: h.points(base[s]).mean(0) + [h.x0, 0] for s, h in hs.items()}
-    mc = (mids["right"][1] - mids["left"][1]) / (mids["right"][0] - mids["left"][0])
+        pin = {**STITCH_DEFAULTS["corner_pin"][s], **pins.get(s, {})}
+        if any(any(v) for v in pin.values()):
+            src = np.float32([[0, 0], [h.w, 0], [h.w, H], [0, H]])
+            dst = src + np.float32([pin["top_left"], pin["top_right"], pin["bottom_right"], pin["bottom_left"]])
+            h.Hm = cv2.getPerspectiveTransform(src, dst).astype(float) @ h.Hm
+    par = {**STITCH_DEFAULTS["parallelogram"], **(st.get("parallelogram") or {})}
+    lines = st.get("lines")
     for s, h in hs.items():
-        m = np.polyfit(*h.points(base[s]).T, 1)[0]
-        xs = float(h.w) if s == "left" else 0.0
-        h.Hm = np.array([[1, 0, 0], [mc - m, 1, -(mc - m) * xs], [0, 0, 1]]) @ h.Hm
-    return Lens(seam, size, hs, stitch.get("seam_warp"))
+        k = par.get(s, 0.0)
+        if not k or not lines:
+            continue
+        x0, xs = h.x0, (float(h.w) if s == "left" else 0.0)
+        loc = lambda pts: h.points(np.asarray(pts, float) - [x0, 0])
+        far, near = _tls_line(loc(st["baseline"][s])), _tls_line(loc(lines["near_wall"][s]))
+        side, zone = _tls_line(loc(lines["side_wall"][s])), _tls_line(loc(lines["zone_line"][s]))
+        horizon = np.cross(np.cross(far, near), np.cross(side, zone))  # line through both vanishing points
+        Hp = np.array([[1, 0, 0], [0, 1, 0], [k * horizon[0] / horizon[2], k * horizon[1] / horizon[2], 1]])
+        # pin the seam column (two points) and the far baseline's outer end back in place
+        b = loc(st["baseline"][s])
+        outer = b[np.argmin(np.abs(b[:, 0] - (h.w - xs)))]
+        anchors = np.array([[xs, cy], [xs, 0.8 * H], outer])
+        moved = _apply(Hp, anchors)
+        h.Hm = _affine_from(moved, anchors) @ Hp @ h.Hm
+    quads = {**STITCH_DEFAULTS["quad"], **(st.get("quad") or {})}
+    for s, h in hs.items():
+        if lines and quads.get(s):
+            src = np.float32(quad_corners(st, h, s))
+            dst = np.float32(np.asarray(quads[s], float) - [h.x0, 0])
+            h.Hm = cv2.getPerspectiveTransform(src, dst).astype(float) @ h.Hm
+    sw = st.get("seam_warp")
+    if sw and not sw.get("enabled", True):
+        sw = None
+    return Lens(seam, size, hs, sw)
 
 
 def main() -> None:
