@@ -185,7 +185,7 @@ In the raw frame, even real arrows were credited to the wrong player about 45% o
 
 ![pillar: original / lens+baseline / final](docs/img/lens_pillar.jpg)
 
-The outer corners stay black. That's expected with radial correction, and nothing is lost there. `Lens.points()` corrects coordinates (arrow blobs, keypoints, boxes) without warping pixels. `Lens.frame()` warps whole frames.
+The corrected 2-minute clip is [`data/sample_2min_corrected.mp4`](data/sample_2min_corrected.mp4). It renders in about real time. The outer corners stay black. That's expected with radial correction, and nothing is lost there. `Lens.points()` corrects coordinates (arrow blobs, keypoints, boxes) without warping pixels. `Lens.frame()` warps whole frames.
 
 **How we got there.** Automatic fitting failed, so I rendered candidates and you picked between them:
 
@@ -243,7 +243,13 @@ uv run python -m archery_tag_stat_tracker.longexposure data/sample_2min.mp4 5.36
 uv run python -m archery_tag_stat_tracker.label out/label   # → http://127.0.0.1:8765/
 ```
 
-`data/sample_2min.mp4` is the first 2 minutes of the full-resolution source ([YouTube](https://www.youtube.com/watch?v=va-S1pJyK5U)). Label coordinates are in source pixels (3490×1400).
+- `data/sample_2min.mp4`: the first 2 minutes of the full-resolution source ([YouTube](https://www.youtube.com/watch?v=va-S1pJyK5U)). Label coordinates are in source pixels (3490×1400).
+- `data/sample_2min_corrected.mp4`: the same 2 minutes, lens-corrected and re-stitched (3490×1400, 60 fps). Made with:
+
+```bash
+uv run python -m archery_tag_stat_tracker.lens build data/stitch/va-S1pJyK5U.json --video data/sample_2min.mp4
+uv run python -m archery_tag_stat_tracker.lens video data/sample_2min.mp4 --out data/sample_2min_corrected.mp4 --crf 27
+```
 
 ## Roadmap
 
