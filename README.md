@@ -12,7 +12,7 @@ _Last updated: 2026-10-08_
 |---|---|
 | Player detection + pose | ✅ Working. Field crop at high res, plus 2× zoomed tiles of the far end |
 | Tracking | ⚠️ Works, but IDs fragment (one player becomes many track IDs) |
-| Shot detection | ⚠️ About 54% of real shots found, about 54% of counted shots real (first minute, see [Results](#results)) |
+| Shot detection | ⚠️ 63% of real shots found, 44% of counted shots real (first minute, v3, see [Results](#results)) |
 | Who's who (player identity) | ⏳ Not started |
 | Hits / catches | ⏳ Not started |
 
@@ -26,7 +26,7 @@ A detected shot counts as correct if it is within **±0.6 s** of a labeled relea
 |---|---|---|---|---|---|
 | v1 | field crop | "draw pose": one hand at the face, the other held out | 23% | 22% | Fails on near players seen from the front or back |
 | v2 | field crop | "aim": both wrists at head height, then drop | 54% | 54% | Tuned on the same 35 labels, so optimistic |
-| v3 | field crop + far-end tiles | "aim" | _running_ | _running_ | |
+| v3 | field crop + far-end tiles | "aim" | **63%** | 44% | Labeled shooters with no detection drop from 8 to 4. But people per frame go from 7.4 to 13.8: the far tiles also pick up spectators and refs behind the field, which adds false shots |
 
 - **Recall:** the share of real shots that were found.
 - **Precision:** the share of counted shots that were real.
@@ -45,7 +45,7 @@ video ──► crop field + far tiles ──► YOLO11-pose ──► NMS merge
 
 - Model: `yolo11s-pose` (17 COCO keypoints), run on Apple Silicon via MPS.
 - **Field crop:** inference runs on `x 300–3300, y 0–1000` instead of the whole frame. Cutting out the ceiling and floor gives players more pixels at the same model input size (`imgsz=3008`).
-- **Far-end tiles:** players at the far end are 70–100 px tall and were often missed mid-draw. The far strip (`y 0–500`) is also run as two overlapping tiles, each upscaled about 2×. This recovered 7 of the 10 missed far shooters (see below).
+- **Far-end tiles:** players at the far end are 70–100 px tall and were often missed mid-draw. The far strip (`y 0–500`) is also run as two overlapping tiles, each upscaled about 2×. In a spot check this recovered 6 of the 10 missed far shooters with confidence ≥ 0.29 (see below).
 - The results are merged with NMS (IoU 0.5).
 
 The test frame with the field crop at high resolution. Nearly every player is found:
@@ -129,9 +129,8 @@ uv run python -m archery_tag_stat_tracker.label out/label   # → http://127.0.0
 
 ## Roadmap
 
-1. Re-run the evaluation with far-end tiles (v3).
+1. **Next:** mask out the area off the field. The far tiles roughly doubled the number of people detected, many of them spectators and refs, and that's now the main source of false shots.
 2. Label 2–3 more minutes from other games, so tuning and testing use different data.
-3. Mask out the area off the field: refs, spectators, and the far back wall.
 4. Re-join track fragments into players using appearance and side, plus a quick naming step.
 5. If the wrist-height rule plateaus, train a small classifier on keypoint sequences (or short player-crop clips), using the labels as training data.
 6. Hits, times hit, and catches.
