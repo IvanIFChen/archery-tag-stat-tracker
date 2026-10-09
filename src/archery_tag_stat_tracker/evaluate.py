@@ -60,5 +60,33 @@ def main() -> None:
         print("false:", r["false"])
 
 
+def score_arrows(flights: list, labels: list, t_max: float, lag=(-0.05, 0.6), **shot_kw) -> dict:
+    """Match arrow-shot flights to labels by time (flight starts shortly after the
+    labeled release) and direction (flies away from the shooter's half)."""
+    from .arrows import ZONE_LEFT, ZONE_RIGHT, dedupe, edge_x, is_shot
+
+    shots = dedupe([s for s in flights if is_shot(s, **shot_kw) and s["t0"] <= t_max])
+    pairs = []
+    for li, l in enumerate(labels):
+        y = max(l["y"], ZONE_LEFT[0][1])
+        left = l["x"] < (edge_x(ZONE_LEFT, y) + edge_x(ZONE_RIGHT, y)) / 2
+        for si, s in enumerate(shots):
+            dt = s["t0"] - l["t"]
+            if lag[0] <= dt <= lag[1] and (s["vx"] > 0) == left:
+                pairs.append((dt, li, si))
+    used_l, used_s, matched = set(), set(), []
+    for dt, li, si in sorted(pairs):
+        if li not in used_l and si not in used_s:
+            used_l.add(li), used_s.add(si), matched.append((li, si, dt))
+    tp = len(matched)
+    return {
+        "labels": len(labels), "detected": len(shots), "tp": tp,
+        "recall": tp / max(1, len(labels)), "precision": tp / max(1, len(shots)),
+        "missed": [labels[i] for i in range(len(labels)) if i not in used_l],
+        "false": [shots[i] for i in range(len(shots)) if i not in used_s],
+        "lags": [round(dt, 2) for *_, dt in matched],
+    }
+
+
 if __name__ == "__main__":
     main()

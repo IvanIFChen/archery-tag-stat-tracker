@@ -12,7 +12,9 @@ _Last updated: 2026-10-08_
 |---|---|
 | Player detection + pose | ✅ Working. Field crop at high res, plus 2× zoomed tiles of the far end |
 | Tracking | ⚠️ Works, but IDs fragment (one player becomes many track IDs) |
-| Shot detection | ⚠️ 63% of real shots found, 44% of counted shots real (first minute, v3, see [Results](#results)) |
+| Shot detection (pose) | ⚠️ 63% of real shots found, 44% of counted shots real (v3) |
+| Shot detection (arrows) | ⚠️ 49% found, **68%** of counted shots real; 34% found / 86% real in a stricter setting (A4, see [Arrow detection](#arrow-detection-long-exposure)) |
+| Shooter attribution from arrows | ⏳ Next |
 | Who's who (player identity) | ⏳ Not started |
 | Hits / catches | ⏳ Not started |
 
@@ -27,6 +29,13 @@ A detected shot counts as correct if it is within **±0.6 s** of a labeled relea
 | v1 | field crop | "draw pose": one hand at the face, the other held out | 23% | 22% | Fails on near players seen from the front or back |
 | v2 | field crop | "aim": both wrists at head height, then drop | 54% | 54% | Tuned on the same 35 labels, so optimistic |
 | v3 | field crop + far-end tiles | "aim" | **63%** | 44% | Labeled shooters with no detection drop from 8 to 4. But people per frame go from 7.4 to 13.8: the far tiles also pick up spectators and refs behind the field, which adds false shots |
+
+| A1 | arrows: frame-by-frame linking | | 14% | 9% | The shooter's body movement stole the arrow's blobs |
+| A2 | arrows: three-blob seeding + player masking | | 26% | 26% | "Must start outside the zone" threw away real arrows |
+| A3 | arrows: speed in body-heights per frame + zone-crossing test | | 69% | 21% | Fake flights from players hidden behind the far-right bunker |
+| A4 | arrows: A3 + at least 5 points + merge duplicates | | 49% | **68%** | Best F1 so far (0.57); tuned on the same labels |
+
+Arrow rows (A1–A4) are scored on time and direction only: a flight must start between 0.05 s before and 0.6 s after a labeled release, and fly away from the shooter's half. They don't yet say *who* shot.
 
 - **Recall:** the share of real shots that were found.
 - **Precision:** the share of counted shots that were real.
@@ -89,6 +98,55 @@ A local web page for marking shots. Play the clip, pause at each release, and cl
 
 See [Results](#results) for the matching criteria.
 
+### 6. Arrow detection (long exposure): [`arrows.py`](src/archery_tag_stat_tracker/arrows.py)
+
+**Why:** pose-based shot detection breaks when a shooter is crouched, behind a bunker, or seen from the front. But every shot has to fly across the **neutral zone**: plain turf, empty during play, and filmed by a fixed camera. So instead of watching the shooter, we watch the middle.
+
+**The long-exposure idea:** stack a short window (about 0.8 s) of frames and keep, for each pixel, the largest change from the background. A flying arrow leaves a streak across the zone. At 60 fps the arrow moves 20–160 px per frame, so the streak is **dotted**, one blob per frame. Coloring each pixel by the frame it first changed in shows the direction of travel.
+
+Each example below has three panels:
+1. The frame at release, with the labeled shooter circled in red.
+2. The long exposure.
+3. The time-colored first-change map.
+
+Cyan arrows are the flights the detector found. White lines are the neutral-zone edges.
+
+**Mid-field, right → left (5.36 s).** The arrow crosses the whole zone in about 5 frames. A second flight (left → right) is the return shot labeled at 5.66 s.
+
+![long exposure 5.36s](docs/img/le_536.jpg)
+
+**Near-left shooter, low and fast (32.25 s).** About 140 px per frame. The flight is only picked up right of the stitch seam (the brightness change mid-image). The part near the shooter is hidden by their own body.
+
+![long exposure 32.25s](docs/img/le_3225.jpg)
+
+**Far end (13.97 s).** Far arrows are small and slow on screen (20–55 px per frame), and the center pillar splits their flights. Speed is therefore measured in player-heights per frame, and flights count if their straight-line extension crosses the zone.
+
+![long exposure 13.97s](docs/img/le_1397.jpg)
+
+**Failure case: false flight (25.6 s).** Players crouched behind the far-right bunker aren't detected as people, so their moving limbs form straight, fast blob chains. This is the main remaining source of false shots.
+
+![false positive 25.6s](docs/img/le_false_2560.jpg)
+
+**Pipeline:**
+1. **Find fast-moving blobs.** In a band around the neutral zone, compare each frame with the frames 2 before and 2 after, and keep the pixels that differ from both. This leaves only fast movers.
+2. **Mask out players.** Ignore blobs inside tracked player boxes.
+3. **Start a flight only from a convincing triplet.** That means three blobs in consecutive frames that are evenly spaced, in a straight line, and fast (15–260 px per frame). Random clutter almost never forms one. The flight is then extended both ways, allowing 1 missed frame.
+4. **Decide whether a flight is a shot.** It must have at least 5 points, move at least 0.25 player-heights per frame, fit a straight line (within 8 px or 15% of its speed), and have a straight-line path that crosses the neutral zone.
+5. **Merge duplicates.** Merge flights going the same way within 0.15 s of each other. One arrow can split into several flights at the seam, at the pillar, or because of blur.
+
+Runs at about 3× real time on an M1 Pro (18 s for 60 s of video).
+
+**Experiment log (first minute, 35 labels):**
+
+| Step | Change | Recall | Precision | What we learned |
+|---|---|---|---|---|
+| A1 | Frame-by-frame nearest-blob linking | 14% | 9% | Arrows move up to 160 px per frame, and the shooter's moving body steals their blobs |
+| A2 | Start flights from 3-blob triplets; mask players; must start outside the zone and enter it | 26% | 26% | Clean arrows found. But arrows often *first appear* inside the zone (hidden by the shooter's body until then), so "starts outside" rejected them |
+| A3 | Speed in player-heights per frame; straight-line extension must cross the zone | 69% | 21% | Far arrows recovered. False flights come from players hidden behind the far-right bunker (see the failure case) |
+| A4 | At least 5 points; merge duplicates | 49% | 68% | Best balance. Setting the minimum to 6 points gives 34% / 86%: a high-precision signal |
+
+**Next:** trace each flight back into the shooter's half and pick the player nearest its line around the release time, using pose (aim → release) as supporting evidence. Then score *who shot* against the labels.
+
 ## Experiments
 
 ### Lens (fisheye) correction: not adopted for now
@@ -121,6 +179,11 @@ uv run python -m archery_tag_stat_tracker.shots out/tracks.npz --video data/samp
 uv run python -m archery_tag_stat_tracker.evaluate out/tracks.npz data/labels_0-60s.json -v
 uv run python -m archery_tag_stat_tracker.tune out/tracks.npz data/labels_0-60s.json
 
+# arrows in flight (uses tracks to mask out players) + long-exposure images
+uv run python -m archery_tag_stat_tracker.arrows data/sample_2min.mp4 --duration 60 --tracks out/tracks.npz --out out/arrows.json
+uv run python -m archery_tag_stat_tracker.longexposure data/sample_2min.mp4 5.36 --crop 1100,150,2800,650 \
+  --arrows out/arrows.json --labels data/labels_0-60s.json --out out/le_536.jpg
+
 # label more footage (expects clip.mp4 in the folder; 1746×700 is fine)
 uv run python -m archery_tag_stat_tracker.label out/label   # → http://127.0.0.1:8765/
 ```
@@ -129,8 +192,10 @@ uv run python -m archery_tag_stat_tracker.label out/label   # → http://127.0.0
 
 ## Roadmap
 
-1. **Next:** mask out the area off the field. The far tiles roughly doubled the number of people detected, many of them spectators and refs, and that's now the main source of false shots.
-2. Label 2–3 more minutes from other games, so tuning and testing use different data.
-4. Re-join track fragments into players using appearance and side, plus a quick naming step.
-5. If the wrist-height rule plateaus, train a small classifier on keypoint sequences (or short player-crop clips), using the labels as training data.
-6. Hits, times hit, and catches.
+1. **Next:** credit each arrow flight to a shooter: trace it back, then choose among nearby players using timing and pose. Score *who shot* against the labels.
+2. Fix false arrow flights from players hidden behind bunkers (for example, ignore blob chains that start and end inside a player's half without reaching the zone).
+3. Mask out the area off the field. The far tiles roughly doubled the number of people detected, many of them spectators and refs.
+4. Label 2–3 more minutes from other games, so tuning and testing use different data.
+5. Re-join track fragments into players using appearance and side, plus a quick naming step.
+6. If the wrist-height rule plateaus, train a small classifier on keypoint sequences (or short player-crop clips), using the labels as training data.
+7. Hits, times hit, and catches (the arrow flights are the starting point).
