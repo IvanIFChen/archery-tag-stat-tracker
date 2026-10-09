@@ -7,6 +7,7 @@ dependencies = [
     "lap>=0.5.13",
     "numpy>=2.5.3",
     "opencv-python>=5.0.0.93",
+    "scipy>=1.18.1",
     "torchvision>=0.29.1",
     "ultralytics>=8.4.174",
 ]

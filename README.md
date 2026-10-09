@@ -14,7 +14,8 @@ _Last updated: 2026-10-08_
 | Tracking | ⚠️ Works, but IDs fragment (one player becomes many track IDs) |
 | Shot detection (pose) | ⚠️ 63% of real shots found, 44% of counted shots real (v3) |
 | Shot detection (arrows) | ⚠️ 49% found, **68%** of counted shots real; 34% found / 86% real in a stricter setting (A4, see [Arrow detection](#arrow-detection-long-exposure)) |
-| Shooter attribution from arrows | ⏳ Next |
+| Shooter attribution from arrows | ⚠️ First try: even for real arrows, only about 55% get the right player at the right time. Straight-line tracing is bent by the fisheye |
+| Lens correction | 🚧 Seam found (x = 1822, two GoPros). Calibrating from the scene alone isn't enough; blocked on camera info (see [Lens correction](#lens-fisheye-correction-in-progress-blocked-on-camera-info)) |
 | Who's who (player identity) | ⏳ Not started |
 | Hits / catches | ⏳ Not started |
 
@@ -145,22 +146,55 @@ Runs at about 3× real time on an M1 Pro (18 s for 60 s of video).
 | A3 | Speed in player-heights per frame; straight-line extension must cross the zone | 69% | 21% | Far arrows recovered. False flights come from players hidden behind the far-right bunker (see the failure case) |
 | A4 | At least 5 points; merge duplicates | 49% | 68% | Best balance. Setting the minimum to 6 points gives 34% / 86%: a high-precision signal |
 
-**Next:** trace each flight back into the shooter's half and pick the player nearest its line around the release time, using pose (aim → release) as supporting evidence. Then score *who shot* against the labels.
+**Crediting a shooter** ([`attribute.py`](src/archery_tag_stat_tracker/attribute.py)): fit a line through the flight and extend it back into the shooter's half. Then pick the tracked player whose shoulders are closest to that line, within 0.8 player-heights, in the 0.6 s before the arrow first appears. Scored strictly (right time **and** the label click inside that player's box):
+
+| Arrow setting | Arrows found | Credited to the right player at the right time: recall / precision |
+|---|---|---|
+| ≥ 4 points | 63% / 27% | 29% / 16% |
+| ≥ 5 points | 49% / 68% | 20% / 35% |
+| ≥ 6 points | 34% / 86% | 17% / 55% |
+
+Even when the arrow is real, it's credited to the wrong player about 45% of the time. A straight line extended over hundreds of fisheye-bent pixels drifts off the shooter. That's the motivation for [lens correction](#lens-fisheye-correction-in-progress-blocked-on-camera-info).
 
 ## Experiments
 
-### Lens (fisheye) correction: not adopted for now
+### Lens (fisheye) correction: in progress, blocked on camera info
 
-I tried OpenCV's fisheye undistortion (equidistant model, single focal length, no calibration target) at f = 900, 1100 and 1300:
+**Why it matters:** crediting an arrow to its shooter means extending the flight's line back into the shooter's half. The fisheye bends straight flights into curves, so a long extension drifts off the true shooter. With each lens corrected, a straight 3D flight looks straight on screen (apart from the arrow's small drop), and tracing it back becomes reliable. Correction also enables a top-down court map.
 
-![undistortion test](docs/img/undistort_test.jpg)
+**The setup:** the footage is **two GoPros** (one per half), stitched side by side. I first tried a single fisheye model for the whole frame. That can't work: no single setting straightens the field lines, because the frame contains two different lenses.
 
-Findings:
-- People near the edges of the frame look more natural after correction. But those near players are already big and easy to detect.
-- Correction **shrinks the center and far end**, which is where the detector struggles most. Far players would get fewer pixels unless the output were upscaled, and the far-end tiles already do that more cheaply.
-- No single radial parameter straightens the field lines. The source is probably already a dewarped panoramic output, not a raw circular fisheye, so a proper fix needs line-based calibration using the field lines and posts.
+![single-model undistortion test](docs/img/undistort_test.jpg)
 
-**Decision:** don't warp the pixels for detection. Geometry correction will be useful later for mapping each player's foot point to **field coordinates**: team side, masking out spectators and refs, and player position heatmaps. That only needs a point mapping fitted to the field lines, not a full-image remap.
+**Seam:** a hard cut at **x = 1822**, with no blending. It's the same at every height, which I found from a step in brightness and texture down that column across 30 frames. The far pillar visibly jumps at the seam because each camera sees it from a slightly different position. The left camera covers x 0–1822 and the right camera x 1822–3490.
+
+![seam zoom](docs/img/seam_zoom.jpg)
+
+**Calibrating without a checkerboard** ([`calib.py`](src/archery_tag_stat_tracker/calib.py)):
+- Take the median of 60 frames to get an empty court.
+- Mark rough seed points on features that are straight in reality: neutral-zone lines, far baselines, side-wall bases, and post edges.
+- Snap each seed to the exact paint line or edge along its normal, to sub-pixel accuracy.
+- Fit an OpenCV fisheye model so those features come out straight.
+
+![snapped line points](docs/img/calib_seeds.jpg)
+
+| Attempt | Model | Result |
+|---|---|---|
+| C1 | per half: f, cx, cy, k1, k2; residual = distance off the fitted line in undistorted coordinates ÷ line length | Fake success (right-half error went to 0). Stretching points toward the edge of the lens makes the lines "long", which shrinks the error |
+| C2 | Same, but the residual is each viewing ray's angle off a great circle (a straight 3D line seen from the camera lies in a plane through the camera) | Fake success again: a huge f squeezes all rays together |
+| C3 | C2 ÷ the line's angular span; bounds for a GoPro-like 100–130° field of view | The lens centers drift far off-center and the corrected halves are clearly warped (below) |
+| C4 | Shared f, k1, k2 for both cameras; lens centers fixed at the middle of each half; curved padding edges removed | The fit runs into its bounds and barely helps (error 0.026 → 0.024). The halves don't behave like centered GoPro frames, probably because the stitcher cropped each camera off-center |
+
+![C3 free fit: wrong](docs/img/calib_free_fit.jpg)
+
+**Where this stands:** a handful of floor lines and posts aren't enough to pin down an off-center, cropped fisheye. One of these would unblock it:
+1. The GoPro model and lens mode (Wide, SuperView or Linear). Known lens profiles would fix the distortion terms, and only the crop offset would need fitting.
+2. The raw per-camera files. No crop, a known lens center, and better quality than the YouTube upload.
+3. A 20-second clip of a checkerboard (printed or on a tablet) waved in front of each mounted camera. Only worth it if the cameras are mounted in the same place each week.
+
+**Plan once calibrated:** undistort only the points we need (arrow blobs, keypoints, boxes) for geometry, which is instant and doesn't touch detection. Then build a re-stitched corrected view, cylindrical rather than flat, since together the two cameras cover nearly 180°. Then a top-down court map.
+
+**Earlier finding that still holds:** warping whole frames for *detection* probably won't help. It shrinks the far end, which is exactly where the detector struggles.
 
 ## Usage
 
